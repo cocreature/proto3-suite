@@ -315,8 +315,9 @@ msgTypeFromDpTypeInfo DotProtoTypeInfo{..} ident = do
     identName <- qualifiedMessageName dotProtoTypeInfoParent ident
     pure $ HsTyCon (Qual modName (HsIdent identName))
 
-haskellName, jsonpbName, grpcName, protobufName, proxyName :: String -> HsQName
+haskellName, haskellIntMapName, jsonpbName, grpcName, protobufName, proxyName :: String -> HsQName
 haskellName  name = Qual (Module "Hs")         (HsIdent name)
+haskellIntMapName name = Qual (Module "HsIntMap") (HsIdent name)
 jsonpbName   name = Qual (Module "HsJSONPB")   (HsIdent name)
 grpcName     name = Qual (Module "HsGRPC")     (HsIdent name)
 protobufName name = Qual (Module "HsProtobuf") (HsIdent name)
@@ -752,9 +753,41 @@ messageInstD ctxt parentIdent msgIdent messageParts = do
 
         FieldOneOf OneofField{subfields} -> do
             parsers <- mapM subfieldParserE subfields
-            pure $  apply oneofE [ HsVar (haskellName "Nothing")
-                                 , HsList parsers
-                                 ]
+            let fieldMap = apply (HsVar $ haskellIntMapName "fromList") [HsList parsers]
+            let wrap = HsParen (HsLambda l [patVar "parser"] (HsTuple [uvar_ "parser", uvar_ "field"]))
+            let inputList = apply (HsVar $ haskellIntMapName "toList") [uvar_ "input"]
+            pure $ HsParen $ HsLet
+              [ HsFunBind [ match_ (HsIdent "parsers") [] (HsUnGuardedRhs fieldMap) [] ] ] $
+              apply (HsVar (protobufName "Parser")) $
+                [ HsParen $ HsLambda l [patVar "input"] $
+                  HsCase
+                    (apply
+                       msumE
+                       [ apply
+                           fmapE
+                           [ HsParen $
+                               HsLambda l
+                                 [HsPTuple [patVar "k", patVar "field"]] $
+                                 apply
+                                   fmapE
+                                   [ wrap
+                                   , apply (HsVar $ haskellIntMapName "lookup") [uvar_ "k", uvar_ "parsers"]
+                                   ]
+                           , inputList
+                           ]
+                       ]
+                    )
+                    [ alt_
+                        (HsPApp (haskellName "Nothing") [])
+                        (HsUnGuardedAlt $ apply pureE [ HsVar (haskellName "Nothing") ])
+                        []
+                    , alt_
+                      (HsPApp (haskellName "Just") [HsPTuple [patVar "p", patVar "v"]])
+                      (HsUnGuardedAlt $ apply (HsVar (protobufName "runParser")) [uvar_ "p", uvar_ "v"])
+                      []
+                    ]
+                ]
+          where
           where
             -- create a list of (fieldNumber, Cons <$> parser)
             subfieldParserE (OneofSubfield fieldNumber consName _ dpType options) = do
@@ -766,11 +799,9 @@ messageInstD ctxt parentIdent msgIdent messageParts = do
                                            (uvar_ consName))
 
               alts <- unwrapE ctxt options dpType decodeMessageFieldE
-
-              pure $ HsTuple
-                   [ fieldNumberE fieldNumber
-                   , HsInfixApp (apply pureE [ fE ]) apOp alts
-                   ]
+              let num = intE (getFieldNumber fieldNumber)
+              let parser = HsInfixApp (apply pureE [ fE ]) apOp alts
+              pure $ HsTuple [num, parser]
 
 
 -- *** Generate ToJSONPB/FromJSONPB instances
@@ -1513,7 +1544,7 @@ dotProtoFieldC, primC, optionalC, repeatedC, nestedRepeatedC, namedC, mapC,
   identifierC, stringLitC, intLitC, floatLitC, boolLitC, trueC, falseC,
   unaryHandlerC, clientStreamHandlerC, serverStreamHandlerC, biDiStreamHandlerC,
   methodNameC, nothingC, justC, forceEmitC, mconcatE, encodeMessageFieldE,
-  fromStringE, decodeMessageFieldE, pureE, returnE, memptyE, msumE, atE, oneofE,
+  fromStringE, decodeMessageFieldE, pureE, returnE, memptyE, msumE, atE,
   fmapE, defaultOptionsE, serverLoopE, convertServerHandlerE,
   convertServerReaderHandlerE, convertServerWriterHandlerE,
   convertServerRWHandlerE, clientRegisterMethodE, clientRequestE :: HsExp
@@ -1541,7 +1572,6 @@ forceEmitC           = HsVar (protobufName "ForceEmit")
 encodeMessageFieldE  = HsVar (protobufName "encodeMessageField")
 decodeMessageFieldE  = HsVar (protobufName "decodeMessageField")
 atE                  = HsVar (protobufName "at")
-oneofE               = HsVar (protobufName "oneof")
 
 trueC                       = HsVar (haskellName "True")
 falseC                      = HsVar (haskellName "False")
@@ -1686,6 +1716,7 @@ defaultImports usesGrpc =
     , importDecl_ (m "Proto3.Suite.JSONPB")   & unqualified          & selecting  [s".=", s".:"]
     , importDecl_ (m "Proto3.Suite.Types")    & qualified protobufNS & everything
     , importDecl_ (m "Proto3.Wire")           & qualified protobufNS & everything
+    , importDecl_ (m "Proto3.Wire.Decode")    & qualified protobufNS & everything
     , importDecl_ (m "Control.Applicative")   & qualified haskellNS  & everything
     , importDecl_ (m "Control.Applicative")   & unqualified          & selecting  [s"<*>", s"<|>", s"<$>"]
     , importDecl_ (m "Control.DeepSeq")       & qualified haskellNS  & everything
@@ -1693,6 +1724,7 @@ defaultImports usesGrpc =
     , importDecl_ (m "Data.ByteString")       & qualified haskellNS  & everything
     , importDecl_ (m "Data.Coerce")           & qualified haskellNS  & everything
     , importDecl_ (m "Data.Int")              & qualified haskellNS  & selecting  [i"Int16", i"Int32", i"Int64"]
+    , importDecl_ (m "Data.IntMap")           & qualified haskellNSIntMap & everything
     , importDecl_ (m "Data.List.NonEmpty")    & qualified haskellNS  & selecting  [HsIThingAll (HsIdent "NonEmpty")]
     , importDecl_ (m "Data.Map")              & qualified haskellNS  & selecting  [i"Map", i"mapKeysMonotonic"]
     , importDecl_ (m "Data.Proxy")            & qualified proxyNS    & everything
@@ -1743,6 +1775,9 @@ defaultImports usesGrpc =
 
 haskellNS :: Module
 haskellNS = Module "Hs"
+
+haskellNSIntMap :: Module
+haskellNSIntMap = Module "HsIntMap"
 
 defaultMessageDeriving :: [HsQName]
 defaultMessageDeriving = map haskellName [ "Show", "Eq", "Ord", "Generic", "NFData" ]
